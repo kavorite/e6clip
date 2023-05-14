@@ -2,14 +2,20 @@ package main
 
 import (
 	"encoding/csv"
+	"flag"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
+	"strconv"
 	"sync"
-	"time"
 
+	"github.com/anthonynsimon/bild/transform"
+	"github.com/kolesa-team/go-webp/decoder"
+	"github.com/kolesa-team/go-webp/encoder"
+	"github.com/kolesa-team/go-webp/webp"
 	"github.com/schollz/progressbar/v3"
 
 	"github.com/jszwec/csvutil"
@@ -22,10 +28,20 @@ var allowFiles = map[string]struct{}{
 	"webp": {},
 }
 
-const userAgent = "e6clip by kavorite"
+var ipath, opath string
+
+const (
+	sourceBaseUrl = "https://static1.e621.net/data/"
+	mirrorBaseUrl = "https://e6_dump.treehaus.dev/e6_dump/"
+	baseUrl       = sourceBaseUrl
+	userAgent     = "e6clip by kavorite"
+	resize        = false
+	width         = 224
+	height        = 224
+)
 
 type setUserAgent struct {
-	inner http.RoundTripper
+	inner http.Transport
 }
 
 func (xport *setUserAgent) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -33,13 +49,8 @@ func (xport *setUserAgent) RoundTrip(req *http.Request) (*http.Response, error) 
 	return xport.inner.RoundTrip(req)
 }
 
-const (
-	opath   = "posts"
-	baseUrl = "https://static1.e621.net/data"
-)
-
 type record struct {
-	ID  string `csv:"id"`
+	ID  int    `csv:"id"`
 	MD5 string `csv:"md5"`
 	Ext string `csv:"file_ext"`
 }
@@ -51,9 +62,15 @@ func fck(err error) {
 }
 
 func records(process func(record)) {
-	istrm, err := os.Open("posts.csv")
+	istrm, err := os.Open(ipath)
 	fck(err)
-	reader := csv.NewReader(istrm)
+	total, err := istrm.Seek(0, io.SeekEnd)
+	fck(err)
+	_, err = istrm.Seek(0, io.SeekStart)
+	fck(err)
+	pbar := progressbar.DefaultBytes(total, fmt.Sprintf("read %s...", ipath))
+	cursor := io.TeeReader(istrm, pbar)
+	reader := csv.NewReader(cursor)
 	fck(err)
 	dec, err := csvutil.NewDecoder(reader)
 	fck(err)
@@ -68,58 +85,105 @@ func records(process func(record)) {
 }
 
 func download(client *http.Client, post record) {
-	stem := fmt.Sprintf("%s/%s/%s.%s", post.MD5[0:2], post.MD5[2:4], post.MD5, post.Ext)
-	name := fmt.Sprintf("%s/%s.%s", opath, post.ID, post.Ext)
-	if _, err := os.Stat(name); err == nil {
-		return
+	var stem string
+	var paths []string
+	if baseUrl == sourceBaseUrl {
+		stem = fmt.Sprintf("%s/%s/%s.%s", post.MD5[0:2], post.MD5[2:4], post.MD5, post.Ext)
+		paths = []string{"sample/", ""}
+	} else {
+		stem = post.MD5 + ".webp"
+		paths = []string{""}
 	}
-	for _, root := range []string{"sample", ""} {
-		link := fmt.Sprintf("%s/%s/%s", baseUrl, root, stem)
-		rsp, err := client.Get(link)
-		fck(err)
-		defer rsp.Body.Close()
-		var dst io.Writer
+	out := fmt.Sprintf("%s/%d.webp", opath, post.ID)
+	var (
+		rsp *http.Response
+		err error
+	)
+	for _, path := range paths {
+		url := baseUrl + path + stem
+		rsp, err = client.Get(url)
 		if rsp.StatusCode == 200 {
-			ostrm, err := os.OpenFile(fmt.Sprintf("%s/%s.%s", opath, post.ID, post.Ext), os.O_CREATE|os.O_WRONLY, 0644)
-			fck(err)
-			dst = ostrm
-			defer ostrm.Close()
-		} else {
-			dst = io.Discard
+			break
 		}
-		_, err = io.Copy(dst, rsp.Body)
+	}
+	fck(err)
+	defer rsp.Body.Close()
+	if rsp.StatusCode == 200 {
+		dst, err := os.CreateTemp("", "")
+		fck(err)
+		if resize {
+			img, err := webp.Decode(rsp.Body, &decoder.Options{})
+			if err != nil {
+				return
+			}
+			img = transform.Resize(img, width, height, transform.Linear)
+			defer dst.Close()
+			opt, err := encoder.NewLosslessEncoderOptions(encoder.PresetDrawing, 100)
+			fck(err)
+			err = webp.Encode(dst, img, opt)
+			fck(err)
+		} else {
+			_, err = io.Copy(dst, rsp.Body)
+			fck(err)
+		}
+		defer os.Rename(dst.Name(), out)
 		fck(err)
 	}
 }
 
 func main() {
-	conns := runtime.NumCPU() * 2
+	flag.StringVar(&ipath, "i", "", "Source csv file")
+	flag.StringVar(&opath, "o", "posts", "Output directory")
+	flag.Parse()
+	if ipath == "" {
+		fmt.Fprintf(os.Stderr, "missing required argument -i\n")
+		return
+	}
+
+	conns := runtime.NumCPU() * 8
 	xport := http.DefaultTransport.(*http.Transport).Clone()
 	xport.MaxIdleConnsPerHost = conns
 	xport.MaxIdleConns = conns
 	xport.MaxConnsPerHost = conns
-	client := &http.Client{Timeout: 10 * time.Second, Transport: &setUserAgent{xport}}
+	client := &http.Client{Transport: &setUserAgent{*xport}}
 	group := sync.WaitGroup{}
 	group.Add(conns)
 	defer group.Wait()
-	posts := make(chan record, conns)
+	queue := make(chan record)
 	if err := os.Mkdir(opath, 0755); err != nil && !os.IsExist(err) {
 		fck(err)
 	}
-	pbar := progressbar.Default(-1, "fetch posts...")
+	stat, err := os.Stat(opath)
+	fck(err)
+	if !stat.IsDir() {
+		fmt.Fprintf(os.Stderr, "fatal: %s is not a directory\n", opath)
+		return
+	}
 	for i := 0; i < conns; i++ {
 		go func() {
 			defer group.Done()
-			for post := range posts {
+			for post := range queue {
 				download(client, post)
 			}
 		}()
 	}
-	records(func(post record) {
-		if _, ok := allowFiles[post.Ext]; ok {
-			posts <- post
+	files, err := os.ReadDir(opath)
+	fck(err)
+	posts := make(map[int]struct{}, len(files))
+	for _, entry := range files {
+		if entry.Type().IsRegular() {
+			f := entry.Name()
+			id, err := strconv.Atoi(f[:len(f)-len(filepath.Ext(f))])
+			fck(err)
+			posts[id] = struct{}{}
 		}
-		pbar.Add(1)
+	}
+	records(func(post record) {
+		_, allow := allowFiles[post.Ext]
+		_, exist := posts[post.ID]
+		if allow && !exist {
+			queue <- post
+		}
 	})
-	close(posts)
+	close(queue)
 }
