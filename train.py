@@ -29,25 +29,12 @@ def ensure_img(posts: pl.DataFrame) -> pl.DataFrame:
     )
 
 
-epochs = 1.0
+epochs = 2.0
 batch_size = 128
-# posts = (
-#     ensure_img(pl.scan_csv("posts.csv", low_memory=False))
-#     .collect()
-# )
+posts = ensure_img(pl.scan_csv("posts.csv")).collect()
 files = os.listdir("posts")
-posts = (
-    pl.scan_csv(
-        "data.csv",
-    )
-    .with_columns(
-        pl.col("file_name").str.split(".").arr.first().cast(int).alias("id"),
-        pl.col("file_name").str.split(".").arr.last().alias("file_ext"),
-        pl.col("text_caption").alias("tag_string"),
-    )
-    .select("id", "file_ext", "tag_string")
-).collect()
 train_steps = np.ceil(epochs * len(posts) / batch_size).astype(int)
+
 rng = jax.random.PRNGKey(42)
 rng, key = jax.random.split(rng)
 
@@ -148,18 +135,23 @@ class TrainState(NamedTuple):
 
 
 def optimizer() -> optax.GradientTransformation:
-    lsched = optax.cosine_onecycle_schedule(train_steps, 1e-4)
-    msched = lambda step: 0.95 - optax.cosine_onecycle_schedule(train_steps, 0.1)(step)
-    return optax.inject_hyperparams(optax.lion)(lsched, msched)
+    lsched = optax.cosine_decay_schedule(1e-5, train_steps)
+    msched = lambda step: 0.99 - optax.cosine_onecycle_schedule(train_steps, 0.9)(step)
+    return optax.chain(
+        optax.adaptive_grad_clip(1e-3),
+        optax.inject_hyperparams(optax.lion)(lsched, msched),
+        optax.zero_nans(),
+    )
 
 
+sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(-1, 1)
 backbone = FlaxCLIPModel.from_pretrained(
     "openai/clip-vit-base-patch32", dtype=jnp.float16
 )
 
 
 def train_init() -> TrainState:
-    params = backbone.params
+    params = jax.device_put(backbone.params, sharding.replicate())
     opt_st = optimizer().init(params)
     loss = EMA.init(0.9)
     return TrainState(params, opt_st, loss)
@@ -218,9 +210,10 @@ with rp.Progress(
         start=False,
     )
     for step, (inputs, labels) in enumerate(it.islice(batches, train_steps)):
-        rng, key = jax.random.split(rng)
+        rng, prngs = jax.random.split(rng, 1 + sharding.shape[-1])
+        (inputs, labels), prngs = jax.device_put(((inputs, labels), prngs), sharding)
+        tstate = train_step(tstate, prngs, inputs, labels)
         pbar.start_task(task)
-        tstate = train_step(tstate, key, inputs, labels)
         pbar.update(task, advance=1, loss=jax.device_get(tstate.loss.s))
 
 backbone.save_pretrained("e6clip", params=tstate.params)
