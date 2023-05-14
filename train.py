@@ -144,7 +144,7 @@ def optimizer() -> optax.GradientTransformation:
     )
 
 
-sharding = jax.sharding.PositionalSharding(jax.devices()).reshape(-1, 1)
+sharding = jax.sharding.PositionalSharding(np.array(jax.devices()).reshape(-1, 1))
 backbone = FlaxCLIPModel.from_pretrained(
     "openai/clip-vit-base-patch32", dtype=jnp.float16
 )
@@ -166,18 +166,23 @@ def objective(params, rng, inputs, labels):
     }
     output = backbone(**inputs, params=params, dropout_rng=rng, train=True)
     weights = jnp.any(inputs["pixel_values"] != 0, axis=(-1, -2, -3))
-    logits = output.logits_per_image, output.logits_per_text
-    losses = map(
+    img_embeds, txt_embeds = map(
+        lambda a: jax.lax.with_sharding_constraint(a, sharding.replicate())
+        / optax.safe_norm(a, 1e-5, axis=-1, keepdims=True),
+        (output.image_embeds, output.text_embeds),
+    )
+    img_logits = img_embeds @ txt_embeds.swapaxes(-1, -2)
+    txt_logits = txt_embeds @ img_embeds.swapaxes(-1, -2)
+    losses = jax.tree_util.tree_map(
         lambda scores: rax.pairwise_logistic_loss(
             scores,
             labels,
             weights=weights,
             lambdaweight_fn=rax.labeldiff_lambdaweight,
-        )
-        / len(logits),
-        logits,
+        ),
+        (img_logits, txt_logits),
     )
-    return sum(losses)
+    return jnp.stack(losses).mean()
 
 
 @partial(jax.jit, donate_argnums=0)
