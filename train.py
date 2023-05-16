@@ -3,6 +3,7 @@ import os
 import os.path as osp
 import sys
 from functools import partial
+from glob import glob
 from multiprocessing.pool import ThreadPool
 from typing import NamedTuple
 
@@ -14,19 +15,43 @@ import optax
 import polars as pl
 import rax
 import rich.progress as rp
-from transformers import CLIPProcessor, FlaxCLIPModel
+from transformers import FlaxViTModel
 
-processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
+jax.config.update("jax_threefry_partitionable", True)
+
+
+base_ckpt = "google/vit-base-patch16-224"
 image_dir = "posts"
+ckpts_dir = "ckpts"
+image_dim = 224
+os.makedirs(ckpts_dir, exist_ok=True)
+
+
+def latest_ckpt():
+    ckpt_names = glob(osp.join(ckpts_dir, "e6clip-e*"))
+    if ckpt_names:
+        ckpt = max(ckpt_names, key=lambda f: os.stat(f).st_mtime)
+    else:
+        ckpt = base_ckpt
+    return ckpt
 
 
 def ensure_img(posts: pl.DataFrame) -> pl.DataFrame:
     stems = os.listdir(image_dir)
-    return (
-        posts.sort("id")
-        .with_columns(pl.lit("webp").alias("file_ext"))
-        .filter((pl.col("id").cast("str") + "." + pl.col("file_ext")).is_in(stems))
-    )
+    return posts.filter((pl.col("md5") + ".webp").is_in(stems))
+
+
+def read_image(md5):
+    stem = f"{md5}.webp"
+    path = osp.join(image_dir, stem)
+    dims = [image_dim, image_dim, 3]
+    if not osp.exists(path):
+        return np.zeros(dims), md5
+    img = cv2.imread(path)
+    if img is None:
+        return np.zeros(dims), md5
+    img = cv2.resize(img, dims[:-1])
+    return img, md5
 
 
 def unif_batch(
@@ -42,62 +67,40 @@ def unif_batch(
         d = len(a) + len(b) - n
         return n / d
 
-    dims = tuple(map(processor.image_processor.crop_size.get, ("width", "height")))
-
-    def read(post_id, file_ext):
-        stem = f"{post_id}.{file_ext}"
-        path = osp.join(image_dir, stem)
-        if osp.exists(path):
-            img = cv2.imread(path)[..., ::-1]
-            img = cv2.resize(img, dims)
-            return img, post_id
-        else:
-            return np.zeros([*size, 3]), post_id
-
     def tags(chunk):
         return (
-            chunk.select("id", pl.col("tag_string").str.split(" ").alias("tags"))
+            chunk.select("md5", pl.col("tag_string").str.split(" ").alias("tags"))
             .explode("tags")
             .sample(
                 30 * len(chunk),
                 shuffle=True,
+                with_replacement=True,
                 seed=rng.bit_generator.random_raw(),
             )
-            .groupby("id")
+            .unique(["md5", "tags"])
+            .groupby("md5")
             .all()
-            .sort("id")
-            .select("tags")
+            .select("md5", pl.col("tags").arr.join(" "))
+            .sort("md5")
+            .drop("md5")
             .to_series()
-            .arr.join(" ")
             .to_list()
         )
 
-    table = posts.select("id", "file_ext", "tag_string")
+    table = posts.select("md5", "tag_string")
     with ThreadPool() as pool:
         for chunk in (
-            table.sample(size, seed=seed).sort("id")
+            table.sample(size, seed=seed).sort("md5")
             for seed in iter(rng.bit_generator.random_raw, None)
         ):
-            pairs = pool.imap_unordered(
-                lambda args: read(*args),
-                chunk.select("id", "file_ext").iter_rows(),
-            )
-            images, image_ids = zip(*pairs)
-            select = np.argsort(image_ids)
-            images = np.stack(images)[select]
-            tag_strs = tags(chunk)
+            pairs = pool.imap_unordered(read_image, chunk.select("md5").to_series())
+            images, image_md5s = zip(*pairs)
+            sorter = np.argsort(image_md5s)
+            images = np.stack(images)[sorter]
             tag_sets = [set(s.split()) for s in tags(chunk)]
             labels = [jaccard(a, b) for a, b in it.product(tag_sets, tag_sets)]
             labels = np.array(labels).reshape(len(images), len(images))
-            inputs = {
-                "pixel_values": images,
-                **processor.tokenizer(
-                    tag_strs,
-                    return_tensors="np",
-                    padding=True,
-                    truncation=True,
-                ),
-            }
+            inputs = {"pixel_values": images}
             yield inputs, labels
 
 
@@ -122,13 +125,6 @@ class TrainState(NamedTuple):
     params: optax.LookaheadParams
     opt_st: optax.OptState
     loss: EMA
-
-
-def standardize(images):
-    offset = np.array(processor.image_processor.image_mean)
-    stddev = np.array(processor.image_processor.image_std)
-    images = (images / 255.0 - offset) / stddev
-    return images
 
 
 def augment(rng, images):
@@ -164,26 +160,32 @@ def augment(rng, images):
     return images
 
 
+dtype_half = jnp.bfloat16 if jax.devices()[0].platform == "tpu" else jnp.float16
+
+
 def main():
-    epochs = 8.0
+    epochs = 1.0
     sharding = jax.sharding.PositionalSharding(np.array(jax.devices()).reshape(-1, 1))
-    n_device = sharding.shape[-1]
-    batch_size = 128 * n_device
-    posts = ensure_img(pl.scan_csv("posts.csv")).collect()
+    batch_size = 512 * jax.device_count()
+    posts = ensure_img(
+        pl.scan_csv("posts.csv", low_memory=True).select("md5", "tag_string")
+    ).collect()
     train_steps = np.ceil(epochs * len(posts) / batch_size).astype(int)
     epoch_steps = np.ceil(len(posts) / batch_size).astype(int)
 
     rng = jax.random.PRNGKey(42)
     rng, key = jax.random.split(rng)
 
-    half_dtype = jnp.bfloat16 if jax.devices()[0].platform == "tpu" else jnp.float16
-    backbone = FlaxCLIPModel.from_pretrained(
-        "openai/clip-vit-base-patch32", dtype=half_dtype
-    )
+    backbone = FlaxViTModel.from_pretrained(latest_ckpt(), dtype=dtype_half)
+    backbone.module.config.image_size = image_dim
 
     def optimizer() -> optax.GradientTransformation:
-        lsched = optax.cosine_decay_schedule(1e-4 * n_device, train_steps)
-        msched = lambda step: 0.9 + 0.09 * step / train_steps
+        peak_lr = 3.75e-4 * jax.device_count()
+        lsched = optax.cosine_onecycle_schedule(
+            peak_lr,
+            train_steps,
+        )
+        msched = lambda step: 0.99 - 0.09 * lsched(step) / peak_lr
         xforms = optax.chain(
             optax.adaptive_grad_clip(1e-3),
             optax.inject_hyperparams(optax.lion)(
@@ -193,49 +195,59 @@ def main():
             ),
             optax.zero_nans(),
         )
-        return optax.lookahead(xforms, sync_period=8, slow_step_size=0.9)
+        return optax.lookahead(optax.flatten(xforms), sync_period=6, slow_step_size=0.5)
 
     def train_init() -> TrainState:
-        params = jax.device_put(backbone.params, sharding.replicate())
+        params = {**backbone.params, "logit_scale": 0.2 / 768**0.5}
+        params = jax.device_put(params, sharding.replicate())
         params = optax.LookaheadParams(
             fast=params,
-            slow=jax.tree_util.tree_map(lambda a: a.astype(half_dtype), params),
+            slow=jax.tree_util.tree_map(
+                lambda a: a.astype(dtype_half),
+                params,
+            ),
         )
         opt_st = optimizer().init(params)
         loss = EMA.init(0.9)
         return TrainState(params, opt_st, loss)
 
-    def objective(params, rng, inputs, labels):
+    def clip_error(params, rng, inputs, labels):
         dropout_rng, augment_rng = jax.random.split(rng)
         images = augment(augment_rng, inputs["pixel_values"])
-        images = standardize(images)
+        images = (images - 127.5) / 255.0
         images = images.swapaxes(-1, -3)
         inputs = {**inputs, "pixel_values": images}
-        output = backbone(**inputs, params=params, dropout_rng=dropout_rng, train=True)
-        losses = jax.tree_util.tree_map(
-            lambda scores: rax.pairwise_logistic_loss(
-                scores, labels, lambdaweight_fn=rax.labeldiff_lambdaweight
-            ),
-            (output.logits_per_image, output.logits_per_text),
+        output = backbone(
+            **inputs,
+            params=params,
+            dropout_rng=dropout_rng,
+            train=True,
         )
-        return jnp.stack(losses).mean()
+        latent = output.pooler_output
+        scores = params["logit_scale"] * latent @ latent.swapaxes(-1, -2)
+        return rax.pairwise_logistic_loss(
+            scores,
+            labels,
+            weights=jnp.all(images != 0, axis=(-1, -2, -3))[..., None, :],
+            lambdaweight_fn=rax.labeldiff_lambdaweight,
+        )
 
     @partial(jax.jit, donate_argnums=0)
     def train_step(tstate: TrainState, rng, inputs, labels) -> TrainState:
-        loss, grad = jax.value_and_grad(objective)(
+        loss, grad = jax.value_and_grad(clip_error)(
             tstate.params.fast, rng, inputs, labels
         )
         ascent_stride = 0.2 / optax.global_norm(grad)
         params = jax.tree_util.tree_map(
             lambda w, dw: w + w**2 * dw * ascent_stride, tstate.params.fast, grad
         )
-        grad = jax.grad(objective)(params, rng, inputs, labels)
+        grad = jax.grad(clip_error)(params, rng, inputs, labels)
         grad, opt_st = optimizer().update(grad, tstate.opt_st, tstate.params)
         params = optax.apply_updates(tstate.params, grad)
         loss = tstate.loss.update(loss)
         return TrainState(params, opt_st, loss)
 
-    batches = unif_batch(batch_size * n_device, jax.device_get(key)[0], posts)
+    batches = unif_batch(batch_size, jax.device_get(key)[0], posts)
     tstate = train_init()
     with rp.Progress(
         "loss: {task.fields[loss]:.3g}",
@@ -251,16 +263,29 @@ def main():
             start=False,
         )
         for step, (inputs, labels) in enumerate(it.islice(batches, train_steps)):
-            rng, prngs = jax.random.split(rng, 1 + n_device)
-            (inputs, labels), prngs = jax.device_put(
-                ((inputs, labels), prngs), sharding
+            rng, key = jax.random.split(rng)
+            images = inputs.pop("pixel_values")
+            inputs, labels = jax.device_put((inputs, labels), sharding)
+            images = jax.device_put(
+                images, sharding.reshape((-1,) + (1,) * (images.ndim - 1))
             )
-            tstate = train_step(tstate, prngs, inputs, labels)
+            inputs["pixel_values"] = images
+            tstate = train_step(tstate, key, inputs, labels)
             pbar.start_task(task)
             pbar.update(task, advance=1, loss=jax.device_get(tstate.loss.s))
-            if step > 0 and step % epoch_steps == 0:
-                epoch = step // epoch_steps
-                backbone.save_pretrained(f"e6clip-e{epoch}", params=tstate.params.slow)
+            final_step = step == train_steps - 1
+            if (step > 0 and step % epoch_steps == 0) or final_step:
+                epoch = (step + 1) // epoch_steps
+                params = jax.device_get(tstate.params.slow)
+                params["pooler"]["dense"]["kernel"] = params["pooler"]["dense"][
+                    "kernel"
+                ] * params.pop("logit_scale")
+                backbone.save_pretrained(
+                    osp.join(".", ckpts_dir, f"e6clip-e{epoch}"),
+                    params=tstate.params.slow,
+                    push_to_hub=final_step,
+                    repo_id="e6clip",
+                )
 
 
 if __name__ == "__main__":
